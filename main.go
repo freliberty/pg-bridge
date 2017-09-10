@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"io/ioutil"
 	"strings"
+	"strconv"
 
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sns"
 	"github.com/lib/pq"
+	"github.com/oleiade/lane"
 )
 
 var usage = `
@@ -38,59 +40,6 @@ var usage = `
 type Route struct {
 	Channel string
 	Topic   string
-}
-
-func main() {
-	log.SetHandler(text.New(os.Stderr))
-
-	routesEnv := os.Getenv("PGB_ROUTES")
-	if len(routesEnv) == 0 {
-		log.Fatal("PGB_ROUTES env var is mandatory to handle routing")
-	}
-
-	routing := strings.Split(routesEnv, ";")
-	routes := []Route{}
-	for i := range routing {
-		rs := strings.Split(routing[i], "|")
-		if len(rs) == 2 {
-			cr := Route{Channel: rs[0], Topic: rs[1]}
-			routes = append(routes, cr)
-		}
-	}
-
-	// setup Postgres
-	pgUrl := os.Getenv("PGB_POSTGRESQL_URL")
-	if len(pgUrl) == 0 {
-		println("PGB_POSTGRESQL_URL env var is mandatory")
-		os.Exit(1)
-	}
-	pg := ConnectPostgres(pgUrl, routes)
-	defer pg.Close()
-
-	// Setup SNS
-	// @TODO figure out how to check that the required
-	// variables are actually present in the session
-	pub := sns.New(session.New())
-
-	//Activate health check
-	go HTTP(pg)
-
-	// route the notifications
-	for {
-		n := <-pg.Notify
-		log.WithField("payload", n.Extra).Infof("notification received from %s", n.Channel)
-
-		for _, rt := range routes {
-			if rt.Channel == n.Channel {
-				topic := rt.Topic
-				if strings.HasPrefix(topic, "http") {
-					go publishHTTP(n.Channel, topic, n.Extra)
-				} else {
-					go publishSNS(pub, n.Channel, topic, n.Extra)
-				}
-			}
-		}
-	}
 }
 
 // publish payload to SNS
@@ -138,19 +87,94 @@ func publishHTTP(channel string, topic string, payload string) {
 	log.Infof("delivered notification from %s to %s with this response: %s", channel, topic, resp.Status)
 }
 
-// ConnectPostgres connect to postgres
-func ConnectPostgres(postgresUrl string, routes []Route) *pq.Listener {
-
-	if postgresUrl == "" {
-		log.Fatal("postgres url is mandatory")
+func setupRoutesFromEnv() map[string]Route {
+	routesEnv := os.Getenv("PGB_ROUTES")
+	if len(routesEnv) == 0 {
+		log.Fatal("PGB_ROUTES env var is mandatory to handle routing")
 	}
+
+	routing := strings.Split(routesEnv, ";")
+
+	routes := make(map[string]Route)
+	for i := range routing {
+		rs := strings.Split(routing[i], "|")
+		if len(rs) == 2 {
+			cr := Route{Channel: rs[0], Topic: rs[1]}
+			routes[cr.Channel] = cr
+		}
+	}
+
+	return routes
+}
+
+func processNotification(notif *pq.Notification, routes map[string]Route, pub *sns.SNS) {
+	notChan := notif.Channel
+	_, exists := routes[notChan]
+	if exists {
+		currRoute := routes[notChan]
+		if strings.HasPrefix(currRoute.Topic, "http") {
+			go publishHTTP(notif.Channel, currRoute.Topic, notif.Extra)
+		} else {
+			go publishSNS(pub, notif.Channel, currRoute.Topic, notif.Extra)
+		}
+	}
+}
+
+func main() {
+	log.SetHandler(text.New(os.Stderr))
+
+	routes := setupRoutesFromEnv()
+
+	//define max queue size
+	maxQueueSize := 50
+	queueSize := os.Getenv("PGB_MAX_QUEUESIZE")
+	if queueSize != "" {
+		maxQueueSize, _ = strconv.Atoi(queueSize)
+	}
+
+	// setup Postgres
+	pgUrl := os.Getenv("PGB_POSTGRESQL_URL")
+	if len(pgUrl) == 0 {
+		println("PGB_POSTGRESQL_URL env var is mandatory")
+		os.Exit(1)
+	}
+	pg := ConnectPostgres(pgUrl, routes)
+	defer pg.Close()
+
+	// Setup SNS
+	// @TODO figure out how to check that the required
+	// variables are actually present in the session
+	pub := sns.New(session.New())
+
+	//Activate health check
+	go HTTP(pg)
+
+	notifsQueue := lane.NewQueue()
+	// route the notifications
+
+	for {
+		n := <-pg.Notify
+		log.WithField("payload", n.Extra).Infof("notification received from %s", n.Channel)
+		notifsQueue.Enqueue(n)
+
+		if notifsQueue.Size() == maxQueueSize {
+			for notifsQueue.Head() != nil {
+				notif := notifsQueue.Dequeue().(*pq.Notification)
+				processNotification(notif, routes, pub)
+			}
+		}
+	}
+}
+
+// ConnectPostgres connect to postgres
+func ConnectPostgres(postgresUrl string, routes map[string]Route) *pq.Listener {
 
 	log.Infof("connecting to postgres: %s...", postgresUrl)
 	client, err := sql.Open("postgres", postgresUrl)
 	if err != nil {
 		log.WithError(err).Fatal("could not connect to postgres")
 	}
-	log.Infof("connected to postgres")
+	log.Infof("connected to postgres server")
 
 	if err := client.Ping(); err != nil {
 		log.WithError(err).Fatal("error connecting to postgres")
@@ -162,7 +186,7 @@ func ConnectPostgres(postgresUrl string, routes []Route) *pq.Listener {
 		}
 	}
 
-	log.Infof("setting up a listener...")
+	log.Infof("setting up postgresql listener...")
 	listener := pq.NewListener(postgresUrl, 10*time.Second, time.Minute, reportProblem)
 	log.Infof("pg listener created ok")
 
