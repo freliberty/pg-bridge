@@ -1,12 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
-	"io/ioutil"
 	"strings"
-	"strconv"
-
 	"net/http"
 	"os"
 	"time"
@@ -14,11 +10,8 @@ import (
 	healthz "github.com/MEDIGO/go-healthz"
 	"github.com/apex/log"
 	"github.com/apex/log/handlers/text"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sns"
 	"github.com/lib/pq"
-	"github.com/oleiade/lane"
+	"github.com/tj/go-kinesis"
 )
 
 var usage = `
@@ -42,50 +35,6 @@ type Route struct {
 	Topic   string
 }
 
-// publish payload to SNS
-func publishSNS(pub *sns.SNS, channel string, topic string, payload string) {
-	SNSPayload := &sns.PublishInput{
-		Message:  aws.String(payload),
-		TopicArn: aws.String(topic),
-	}
-
-	_, err := pub.Publish(SNSPayload)
-	if err != nil {
-		log.WithError(err).WithField("channel", channel).WithField("payload", payload).Error("unable to send payload to SNS")
-	}
-
-	log.Infof("delivered notification from %s to SNS", channel)
-	return
-}
-
-func publishHTTP(channel string, topic string, payload string) {
-	body := []byte(payload)
-
-	req, err := http.NewRequest("POST", topic, bytes.NewBuffer(body))
-	if err != nil {
-		log.WithError(err).Error("error POSTing")
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	log.Info("POSTing...")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.WithError(err).Error("unable to POST")
-		return
-	}
-	defer resp.Body.Close()
-
-	_, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.WithError(err).Error("cannot read body")
-		return
-	}
-
-	log.Infof("delivered notification from %s to %s with this response: %s", channel, topic, resp.Status)
-}
 
 func setupRoutesFromEnv() map[string]Route {
 	routesEnv := os.Getenv("PGB_ROUTES")
@@ -107,15 +56,16 @@ func setupRoutesFromEnv() map[string]Route {
 	return routes
 }
 
-func processNotification(notif *pq.Notification, routes map[string]Route, pub *sns.SNS) {
+
+func processNotification(notif *pq.Notification, routes map[string]Route, producer *kinesis.Producer) {
 	notChan := notif.Channel
 	_, exists := routes[notChan]
 	if exists {
 		currRoute := routes[notChan]
-		if strings.HasPrefix(currRoute.Topic, "http") {
-			go publishHTTP(notif.Channel, currRoute.Topic, notif.Extra)
-		} else {
-			go publishSNS(pub, notif.Channel, currRoute.Topic, notif.Extra)
+		ba := []byte(notif.Extra)
+		err := producer.Put(ba, currRoute.Topic)
+		if err != nil {
+			log.WithError(err).Fatal("error producing")
 		}
 	}
 }
@@ -124,13 +74,6 @@ func main() {
 	log.SetHandler(text.New(os.Stderr))
 
 	routes := setupRoutesFromEnv()
-
-	//define max queue size
-	maxQueueSize := 50
-	queueSize := os.Getenv("PGB_MAX_QUEUESIZE")
-	if queueSize != "" {
-		maxQueueSize, _ = strconv.Atoi(queueSize)
-	}
 
 	// setup Postgres
 	pgUrl := os.Getenv("PGB_POSTGRESQL_URL")
@@ -141,28 +84,21 @@ func main() {
 	pg := ConnectPostgres(pgUrl, routes)
 	defer pg.Close()
 
-	// Setup SNS
-	// @TODO figure out how to check that the required
-	// variables are actually present in the session
-	pub := sns.New(session.New())
+	// Setup Kinesis
+	producer := kinesis.New(kinesis.Config{
+		StreamName: "webhooks",
+		FlushInterval: 10,
+		BufferSize: 5,
+	})
+	producer.Start()
 
 	//Activate health check
 	go HTTP(pg)
 
-	notifsQueue := lane.NewQueue()
-	// route the notifications
-
 	for {
 		n := <-pg.Notify
 		log.WithField("payload", n.Extra).Infof("notification received from %s", n.Channel)
-		notifsQueue.Enqueue(n)
-
-		if notifsQueue.Size() == maxQueueSize {
-			for notifsQueue.Head() != nil {
-				notif := notifsQueue.Dequeue().(*pq.Notification)
-				processNotification(notif, routes, pub)
-			}
-		}
+		go processNotification(n, routes, producer)
 	}
 }
 
