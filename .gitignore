@@ -1,4 +1,6 @@
 /.envrc
+main
+.idea
 /.env
 /functions
 /project.json
