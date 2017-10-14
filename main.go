@@ -15,12 +15,11 @@ import (
 )
 
 var usage = `
-    PG Bridge: Send Postgres notifications to SNS or to a webhook.
+    PG Bridge: Send Postgres notifications to kinesis stream
 
     Usage:
 
       pg-bridge
-
 			PGB_ROUTES and PGB_POSTGRESQL_URL env vars at least must be setted
 			defaults for health check is HOST:5000/health
 			
