@@ -2,14 +2,15 @@ package main
 
 import (
 	"database/sql"
-	"strings"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	healthz "github.com/MEDIGO/go-healthz"
 	"github.com/apex/log"
 	"github.com/apex/log/handlers/text"
+	"github.com/kelseyhightower/envconfig"
 	"github.com/lib/pq"
 	"github.com/tj/go-kinesis"
 )
@@ -20,7 +21,7 @@ var usage = `
     Usage:
 
       pg-bridge
-			PGB_ROUTES and PGB_POSTGRESQL_URL env vars at least must be setted
+			PGB_ROUTES, PGB_POSTGRESQL_URL and PGB_KINESIS_STREAM_NAME env vars at least must be setted
 			defaults for health check is HOST:5000/health
 			
     Options:
@@ -34,6 +35,13 @@ type Route struct {
 	Topic   string
 }
 
+type PgbridgeConfig struct {
+	Routes               string        `required:"true"`
+	PostgresqlUrl        string        `split_words:"true" required:"true"`
+	KinesisStreamName    string        `split_words:"true" required:"true"`
+	KinesisBufferSize    int           `split_words:"true" default:"10"`
+	KinesisFlushInterval time.Duration `split_words:"true" default:"10s"`
+}
 
 func setupRoutesFromEnv() map[string]Route {
 	routesEnv := os.Getenv("PGB_ROUTES")
@@ -55,7 +63,6 @@ func setupRoutesFromEnv() map[string]Route {
 	return routes
 }
 
-
 func processNotification(notif *pq.Notification, routes map[string]Route, producer *kinesis.Producer) {
 	notChan := notif.Channel
 	_, exists := routes[notChan]
@@ -70,26 +77,40 @@ func processNotification(notif *pq.Notification, routes map[string]Route, produc
 }
 
 func main() {
-	log.SetHandler(text.New(os.Stderr))
 
-	routes := setupRoutesFromEnv()
+	var cfg PgbridgeConfig
+	err := envconfig.Process("pgb", &cfg)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 
-	// setup Postgres
-	pgUrl := os.Getenv("PGB_POSTGRESQL_URL")
+	// setup Env Vars
+	pgUrl := cfg.PostgresqlUrl
 	if len(pgUrl) == 0 {
 		println("PGB_POSTGRESQL_URL env var is mandatory")
 		os.Exit(1)
 	}
+	streamName := cfg.KinesisStreamName
+	if len(streamName) == 0 {
+		println("PGB_STREAM_NAME env var is mandatory")
+		os.Exit(1)
+	}
+
+	log.SetHandler(text.New(os.Stderr))
+
+	routes := setupRoutesFromEnv()
+
 	pg := ConnectPostgres(pgUrl, routes)
 	defer pg.Close()
 
 	// Setup Kinesis
 	producer := kinesis.New(kinesis.Config{
-		StreamName: "webhooks",
-		FlushInterval: 10,
-		BufferSize: 5,
+		StreamName:    streamName,
+		FlushInterval: cfg.KinesisFlushInterval,
+		BufferSize:    cfg.KinesisBufferSize,
 	})
 	producer.Start()
+	defer producer.Stop()
 
 	//Activate health check
 	go HTTP(pg)
